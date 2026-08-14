@@ -77,14 +77,38 @@ desktop-helpworker/
 │  └─ Models.cs                 本地数据模型
 ├─ CHANGELOG.md                 版本更新记录
 ├─ 桌面助手产品规划.md          产品与功能规划
-├─ build.ps1                    发布脚本
+├─ setup.ps1                    首次安装与环境准备
+├─ build.ps1                    自包含版本发布脚本
 ├─ run.ps1                      开发运行脚本
+├─ 首次安装.cmd                 新电脑双击安装入口
+├─ 备份数据.cmd / 恢复数据.cmd  个人记录迁移入口
 └─ 启动浮岛.cmd                 Windows 快速启动入口
+```
+
+## 新电脑快速开始
+
+克隆仓库后，直接双击：
+
+```text
+首次安装.cmd
+```
+
+脚本会检查 .NET 8 SDK。电脑中没有 SDK 时，会从微软官方下载到仓库内的 `.tools` 目录，然后构建一个位于 `dist\FloatMate` 的 Windows x64 自包含版本，并创建桌面快捷方式。
+
+以后可以双击 `启动浮岛.cmd`。如果尚未完成首次构建，启动脚本也会自动进入安装流程。
+
+命令行方式：
+
+```powershell
+git clone https://github.com/xxxlibraaa-commits/desktop-helpworker.git
+cd desktop-helpworker
+.\setup.ps1
+.\run.ps1
 ```
 
 ## 开发运行
 
-需要安装 .NET 8 SDK 和 Windows Desktop Runtime。
+开发模式需要 .NET 8 SDK。`run.ps1` 会依次查找仓库内工具链、原开发环境工具链和系统 `PATH`。
 
 ```powershell
 dotnet restore .\FloatMate\FloatMate.csproj
@@ -100,18 +124,75 @@ dotnet run --project .\FloatMate\FloatMate.csproj
 ## 构建发布
 
 ```powershell
-dotnet publish .\FloatMate\FloatMate.csproj `
-  -c Release `
-  -r win-x64 `
-  --self-contained false `
-  -p:PublishSingleFile=true
+.\build.ps1
 ```
 
-发布结果位于：
+默认生成无需预装 .NET Runtime 的自包含单文件版本：
 
 ```text
-FloatMate\bin\Release\net8.0-windows\win-x64\publish\
+dist\FloatMate\FloatMate.exe
 ```
+
+如果只需要体积更小、依赖系统已安装 .NET Desktop Runtime 的版本，可以运行：
+
+```powershell
+.\build.ps1 -FrameworkDependent
+```
+
+该版本输出到 `dist\FloatMate-framework-dependent`，不会覆盖默认的自包含版本。
+
+## 更换电脑与个人数据迁移
+
+### 在新电脑安装程序
+
+1. 在新电脑安装 Git；
+2. 克隆仓库并进入目录；
+3. 双击 `首次安装.cmd`；
+4. 安装完成后双击 `启动浮岛.cmd`。
+
+```powershell
+git clone https://github.com/xxxlibraaa-commits/desktop-helpworker.git
+cd desktop-helpworker
+.\setup.ps1
+```
+
+首次安装会优先使用电脑中已有的 .NET 8 SDK。如果没有，会从微软官方下载到仓库的 `.tools\dotnet` 目录，然后生成位于 `dist\FloatMate` 的 Windows x64 自包含版本。因此最终应用不依赖新电脑预先安装 .NET Runtime。
+
+### 迁移个人记录
+
+个人记录不会自动进入 GitHub。推荐通过 U 盘、加密网盘或其他可信私人渠道单独迁移。
+
+旧电脑：
+
+1. 从系统托盘退出 FloatMate；
+2. 双击 `备份数据.cmd`；
+3. 复制 `migration-data` 中最新的 `FloatMate-data-*.json`。
+
+新电脑：
+
+1. 完成 FloatMate 首次安装；
+2. 从系统托盘退出 FloatMate；
+3. 将备份文件放进仓库的 `migration-data` 文件夹；
+4. 双击 `恢复数据.cmd`；
+5. 重新启动 FloatMate。
+
+恢复前，如果新电脑已经存在记录，脚本会先在 `migration-data` 中生成 `pre-restore-*.json` 备份。
+
+### GitHub 保存范围
+
+GitHub 仓库包含：
+
+- 应用源代码；
+- 安装、构建、启动和迁移脚本；
+- 产品规划、设计规范、README 和更新记录。
+
+以下目录受 `.gitignore` 保护，不会被正常提交：
+
+- `.tools`：首次安装下载的 .NET SDK；
+- `dist`：本机构建结果；
+- `migration-data`：个人数据备份；
+- `bin`、`obj`：编译缓存；
+- `.codex-temp`、预览图和测试输出。
 
 ## 本地数据与隐私
 
@@ -124,7 +205,7 @@ FloatMate\bin\Release\net8.0-windows\win-x64\publish\
 - 目标、健康、长期计划和应用使用时间不会自动上传；
 - 导出文件只有在用户主动点击导出时才会生成；
 - GitHub 仓库只保存源代码和说明文档；
-- `bin`、`obj`、备份、预览图和本地测试输出均通过 `.gitignore` 排除。
+- `.tools`、`dist`、`migration-data`、`bin`、`obj`、预览图和本地测试输出均通过 `.gitignore` 排除。
 
 ## 设计原则
 

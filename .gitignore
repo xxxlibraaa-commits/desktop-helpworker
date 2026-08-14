@@ -4,9 +4,14 @@
 **/backups/
 .codex-temp/
 .codex-*/
+.tools/
+dist/
+artifacts/
+migration-data/
 .vs/
 *.user
 *.suo
 *.log
 *.tmp
+*.zip
 FloatMate/*preview*.png
