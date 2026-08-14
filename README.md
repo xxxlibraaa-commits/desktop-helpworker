@@ -106,6 +106,16 @@ cd desktop-helpworker
 .\run.ps1
 ```
 
+## 下载已构建版本
+
+不需要修改代码时，可以从 [GitHub Releases](https://github.com/xxxlibraaa-commits/desktop-helpworker/releases) 下载 `FloatMate-v0.4.1-win-x64.zip`：
+
+1. 解压 ZIP；
+2. 双击 `FloatMate.exe`；
+3. 首次启动后按需要开启开机启动。
+
+发布包是 Windows x64 自包含版本，不要求电脑预装 .NET Runtime。个人目标、计划和健康记录仍保存在 `%LOCALAPPDATA%\FloatMate\data.json`，升级应用不会覆盖这些数据。
+
 ## 开发运行
 
 开发模式需要 .NET 8 SDK。`run.ps1` 会依次查找仓库内工具链、原开发环境工具链和系统 `PATH`。
