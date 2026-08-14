@@ -22,16 +22,23 @@ public partial class MainWindow : Window
     private readonly SystemMonitor _monitor = new();
     private readonly AppBarManager _appBar = new();
     private readonly XlsmExportService _xlsmExporter = new();
+    private readonly WorkDocxExportService _workDocxExporter = new();
+    private readonly HealthWorkbookService _healthWorkbookExporter = new();
+    private readonly PlanWorkbookService _planWorkbook = new();
+    private readonly ForegroundAppUsageMonitor _usageMonitor = new();
     private readonly DispatcherTimer _systemTimer = new() { Interval = TimeSpan.FromSeconds(3) };
     private readonly DispatcherTimer _focusTimer = new() { Interval = TimeSpan.FromSeconds(1) };
     private readonly DispatcherTimer _saveTimer = new() { Interval = TimeSpan.FromMilliseconds(350) };
     private readonly DispatcherTimer _toastTimer = new() { Interval = TimeSpan.FromSeconds(3) };
     private readonly DispatcherTimer _reminderTimer = new() { Interval = TimeSpan.FromSeconds(30) };
+    private readonly DispatcherTimer _usageTimer = new() { Interval = TimeSpan.FromSeconds(5) };
     private readonly DispatcherTimer _collapseTimer = new() { Interval = TimeSpan.FromMilliseconds(900) };
     private readonly ObservableCollection<GoalItem> _goals = [];
+    private readonly ObservableCollection<LongPlan> _plans = [];
     private readonly List<GoalItem> _allGoals = [];
     private readonly List<QuickRecord> _records = [];
     private readonly List<ActivityEvent> _events = [];
+    private readonly List<AppUsageEntry> _appUsage = [];
     private readonly Dictionary<string, DateTime> _lastReminderShown = [];
     private readonly DateTime _sessionStartedAt = DateTime.Now;
     private AppData _data = new();
@@ -47,16 +54,21 @@ public partial class MainWindow : Window
     private int _lastDeletedAllIndex = -1;
     private double _floatingLeft = double.NaN;
     private double _floatingTop = double.NaN;
+    private DateTime _lastUsageSaveAt = DateTime.MinValue;
 
     public MainWindow()
     {
         InitializeComponent();
         GoalsList.ItemsSource = _goals;
+        PlanView.DataChanged += (_, _) => QueueSave();
+        PlanView.ImportRequested += (_, _) => ImportPlanWorkbook();
+        PlanView.ExportRequested += (_, plan) => ExportPlanWorkbook(plan);
         _systemTimer.Tick += (_, _) => RefreshSystemStatus();
         _focusTimer.Tick += (_, _) => TickFocus();
         _saveTimer.Tick += (_, _) => { _saveTimer.Stop(); SaveNow(); };
         _toastTimer.Tick += (_, _) => HideToast();
         _reminderTimer.Tick += (_, _) => CheckReminders();
+        _usageTimer.Tick += (_, _) => TrackForegroundApp();
         _collapseTimer.Tick += (_, _) => { _collapseTimer.Stop(); if (_isExpanded && AutoCollapseCheck.IsChecked == true) SetExpanded(false); };
     }
 
@@ -66,6 +78,9 @@ public partial class MainWindow : Window
         _allGoals.AddRange(_data.Goals);
         _records.AddRange(_data.Records);
         _events.AddRange(_data.Events);
+        _appUsage.AddRange(_data.AppUsage);
+        foreach (var plan in _data.Plans) _plans.Add(plan);
+        PlanView.BindPlans(_plans);
         var today = DateOnly.FromDateTime(DateTime.Now);
         foreach (var goal in _allGoals.Where(g => g.Date == today)) _goals.Add(goal);
 
@@ -96,9 +111,12 @@ public partial class MainWindow : Window
         UpdateSummaries();
         RefreshHistoryDates();
         RefreshSystemStatus();
+        RefreshUsageView();
         _systemTimer.Start();
         _focusTimer.Start();
         _reminderTimer.Start();
+        _usageMonitor.ResetClock();
+        _usageTimer.Start();
         _initializing = false;
         QueueSave();
 
@@ -200,8 +218,28 @@ public partial class MainWindow : Window
 
     private void GoalInput_KeyDown(object sender, System.Windows.Input.KeyEventArgs e)
     {
-        if (e.Key == Key.Enter) AddGoal();
-        if (e.Key == Key.Escape) AddGoalPanel.Visibility = Visibility.Collapsed;
+        if (e.Key == Key.Enter && Keyboard.Modifiers.HasFlag(ModifierKeys.Control))
+        {
+            AddGoal();
+            e.Handled = true;
+        }
+        else if (e.Key == Key.Enter)
+        {
+            GoalDetailsInput.Focus();
+            Keyboard.Focus(GoalDetailsInput);
+            e.Handled = true;
+        }
+        else if (e.Key == Key.Escape) AddGoalPanel.Visibility = Visibility.Collapsed;
+    }
+
+    private void GoalDetailsInput_KeyDown(object sender, System.Windows.Input.KeyEventArgs e)
+    {
+        if (e.Key == Key.Enter && Keyboard.Modifiers.HasFlag(ModifierKeys.Control))
+        {
+            AddGoal();
+            e.Handled = true;
+        }
+        else if (e.Key == Key.Escape) AddGoalPanel.Visibility = Visibility.Collapsed;
     }
 
     private void AddGoal_Click(object sender, RoutedEventArgs e) => AddGoal();
@@ -212,16 +250,76 @@ public partial class MainWindow : Window
         if (string.IsNullOrWhiteSpace(title)) return;
         var estimate = GoalEstimateCombo.SelectedItem is ComboBoxItem estimateItem && int.TryParse(estimateItem.Tag?.ToString(), out var parsed)
             ? parsed : 60;
-        var goal = new GoalItem { Title = title, Date = DateOnly.FromDateTime(DateTime.Now), EstimateMinutes = estimate };
+        var goal = new GoalItem
+        {
+            Title = title,
+            Details = GoalDetailsInput.Text.Trim(),
+            Date = DateOnly.FromDateTime(DateTime.Now),
+            EstimateMinutes = estimate
+        };
         _goals.Add(goal);
         _allGoals.Add(goal);
-        AddActivity("目标", "新增目标", title, goal.Id);
+        AddActivity("目标", "新增目标", BuildGoalActivityDetail(goal), goal.Id);
         GoalInput.Clear();
+        GoalDetailsInput.Clear();
         AddGoalPanel.Visibility = Visibility.Collapsed;
         ShowToast("目标已添加");
         UpdateSummaries();
         QueueSave();
     }
+
+    private void GoalDetailsEdit_Click(object sender, RoutedEventArgs e)
+    {
+        if ((sender as FrameworkElement)?.Tag is not GoalItem goal) return;
+        foreach (var item in _goals.Where(item => item != goal)) item.IsEditingDetails = false;
+        goal.EditingDetails = goal.Details;
+        goal.IsEditingDetails = true;
+    }
+
+    private void GoalDetailsSave_Click(object sender, RoutedEventArgs e)
+    {
+        if ((sender as FrameworkElement)?.Tag is GoalItem goal) SaveGoalDetails(goal);
+    }
+
+    private void GoalDetailsCancel_Click(object sender, RoutedEventArgs e)
+    {
+        if ((sender as FrameworkElement)?.Tag is not GoalItem goal) return;
+        goal.EditingDetails = goal.Details;
+        goal.IsEditingDetails = false;
+    }
+
+    private void GoalDetailsEditor_KeyDown(object sender, System.Windows.Input.KeyEventArgs e)
+    {
+        if ((sender as FrameworkElement)?.DataContext is not GoalItem goal) return;
+        if (e.Key == Key.Enter && Keyboard.Modifiers.HasFlag(ModifierKeys.Control))
+        {
+            SaveGoalDetails(goal);
+            e.Handled = true;
+        }
+        else if (e.Key == Key.Escape)
+        {
+            goal.EditingDetails = goal.Details;
+            goal.IsEditingDetails = false;
+            e.Handled = true;
+        }
+    }
+
+    private void SaveGoalDetails(GoalItem goal)
+    {
+        var details = goal.EditingDetails.Trim();
+        var changed = !string.Equals(details, goal.Details, StringComparison.Ordinal);
+        goal.Details = details;
+        goal.IsEditingDetails = false;
+        if (!changed) return;
+        AddActivity("目标", details.Length == 0 ? "清除工作内容" : "更新工作内容", BuildGoalActivityDetail(goal), goal.Id);
+        ShowToast("工作内容已保存");
+        RefreshHistoryDates();
+        QueueSave();
+    }
+
+    private static string BuildGoalActivityDetail(GoalItem goal) => goal.HasDetails
+        ? $"{goal.Title}\n{goal.Details}"
+        : goal.Title;
 
     private void GoalStart_Click(object sender, RoutedEventArgs e)
     {
@@ -350,25 +448,25 @@ public partial class MainWindow : Window
         _events.Add(new ActivityEvent { Category = category, Title = title, Detail = detail, GoalId = goalId });
     }
 
-    private void ExportXlsm_Click(object sender, RoutedEventArgs e)
+    private void ExportWorkXlsm_Click(object sender, RoutedEventArgs e)
     {
         var today = DateOnly.FromDateTime(DateTime.Now);
         var dialog = new Microsoft.Win32.SaveFileDialog
         {
-            Title = "导出今日记录",
+            Title = "导出今日工作 XLSM",
             Filter = "Excel 宏启用工作簿 (*.xlsm)|*.xlsm",
             DefaultExt = ".xlsm",
             AddExtension = true,
             OverwritePrompt = true,
-            FileName = $"FloatMate-今日记录-{today:yyyy-MM-dd}.xlsm"
+            FileName = $"FloatMate-工作-{today:yyyy-MM-dd}.xlsm"
         };
 
         if (dialog.ShowDialog(this) != true) return;
 
         try
         {
-            ExportTodayWorkbook(dialog.FileName);
-            ShowToast("今日记录已导出");
+            ExportWorkWorkbook(dialog.FileName);
+            ShowToast("工作 XLSM 已导出");
         }
         catch (Exception exception)
         {
@@ -377,12 +475,75 @@ public partial class MainWindow : Window
         }
     }
 
-    public void ExportTodayWorkbook(string outputPath)
+    private void ExportWorkDocx_Click(object sender, RoutedEventArgs e)
+    {
+        var today = DateOnly.FromDateTime(DateTime.Now);
+        var dialog = new Microsoft.Win32.SaveFileDialog
+        {
+            Title = "导出今日工作 DOCX",
+            Filter = "Word 文档 (*.docx)|*.docx",
+            DefaultExt = ".docx",
+            AddExtension = true,
+            OverwritePrompt = true,
+            FileName = $"FloatMate-工作日报-{today:yyyy-MM-dd}.docx"
+        };
+        if (dialog.ShowDialog(this) != true) return;
+        try
+        {
+            ExportWorkDocument(dialog.FileName);
+            ShowToast("工作 DOCX 已导出");
+        }
+        catch (Exception exception)
+        {
+            System.Windows.MessageBox.Show(this, $"无法导出文件。\n\n{exception.Message}", "导出 DOCX",
+                MessageBoxButton.OK, MessageBoxImage.Information);
+        }
+    }
+
+    private void ExportHealthXlsx_Click(object sender, RoutedEventArgs e)
+    {
+        var today = DateOnly.FromDateTime(DateTime.Now);
+        var dialog = new Microsoft.Win32.SaveFileDialog
+        {
+            Title = "导出今日健康记录",
+            Filter = "Excel 工作簿 (*.xlsx)|*.xlsx",
+            DefaultExt = ".xlsx",
+            AddExtension = true,
+            OverwritePrompt = true,
+            FileName = $"FloatMate-健康记录-{today:yyyy-MM-dd}.xlsx"
+        };
+        if (dialog.ShowDialog(this) != true) return;
+        try
+        {
+            ExportHealthWorkbook(dialog.FileName);
+            ShowToast("健康表格已导出");
+        }
+        catch (Exception exception)
+        {
+            System.Windows.MessageBox.Show(this, $"无法导出文件。\n\n{exception.Message}", "导出健康表格",
+                MessageBoxButton.OK, MessageBoxImage.Information);
+        }
+    }
+
+    public void ExportWorkWorkbook(string outputPath)
     {
         var today = DateOnly.FromDateTime(DateTime.Now);
         var goals = _allGoals.Where(goal => goal.Date == today).ToList();
+        _xlsmExporter.ExportWorkToday(outputPath, today, goals);
+    }
+
+    public void ExportWorkDocument(string outputPath)
+    {
+        var today = DateOnly.FromDateTime(DateTime.Now);
+        var goals = _allGoals.Where(goal => goal.Date == today).ToList();
+        _workDocxExporter.ExportToday(outputPath, today, goals);
+    }
+
+    public void ExportHealthWorkbook(string outputPath)
+    {
+        var today = DateOnly.FromDateTime(DateTime.Now);
         var records = _records.Where(record => DateOnly.FromDateTime(record.Timestamp) == today).ToList();
-        _xlsmExporter.ExportToday(outputPath, today, goals, records);
+        _healthWorkbookExporter.ExportToday(outputPath, today, records);
     }
 
     private void UpdateSummaries()
@@ -426,7 +587,82 @@ public partial class MainWindow : Window
         MiniProgressBar.Value = _runningGoal?.Progress ?? (_goals.Count == 0 ? 0 : _goals.Average(g => g.Progress));
     }
 
+    private void TrackForegroundApp()
+    {
+        var sample = _usageMonitor.Capture();
+        var usageChanged = false;
+        if (sample is not null)
+        {
+            var date = DateOnly.FromDateTime(sample.CapturedAt);
+            var entry = _appUsage.FirstOrDefault(item => item.Date == date &&
+                item.ProcessName.Equals(sample.ProcessName, StringComparison.OrdinalIgnoreCase));
+            if (entry is null)
+            {
+                entry = new AppUsageEntry
+                {
+                    Date = date,
+                    ProcessName = sample.ProcessName,
+                    DisplayName = sample.DisplayName
+                };
+                _appUsage.Add(entry);
+            }
+
+            entry.DisplayName = sample.DisplayName;
+            entry.ActiveSeconds += sample.ActiveSeconds;
+            entry.LastSeenAt = sample.CapturedAt;
+            usageChanged = true;
+        }
+
+        if (UsageScroll.Visibility == Visibility.Visible) RefreshUsageView();
+        if (usageChanged && DateTime.Now - _lastUsageSaveAt >= TimeSpan.FromMinutes(1))
+        {
+            _lastUsageSaveAt = DateTime.Now;
+            QueueSave();
+        }
+    }
+
+    private void RefreshUsageView()
+    {
+        var today = DateOnly.FromDateTime(DateTime.Now);
+        var entries = _appUsage.Where(item => item.Date == today && item.ActiveSeconds > 0)
+            .OrderByDescending(item => item.ActiveSeconds)
+            .ToList();
+        var totalSeconds = entries.Sum(item => item.ActiveSeconds);
+        var maxSeconds = entries.FirstOrDefault()?.ActiveSeconds ?? 1;
+
+        UsageTotalText.Text = FormatUsageDuration(totalSeconds);
+        UsageCountText.Text = entries.Count == 0 ? "暂无数据" : $"{entries.Count} 个应用";
+        UsageTopAppText.Text = entries.Count == 0
+            ? "从现在开始累计今天的前台活跃时间"
+            : $"使用最多 · {entries[0].DisplayName}  {FormatUsageDuration(entries[0].ActiveSeconds)}";
+        UsageTrackingText.Text = _usageMonitor.StatusText;
+        UsageList.ItemsSource = entries.Select(item => new AppUsageRow
+        {
+            DisplayName = item.DisplayName,
+            ProcessText = $"{item.ProcessName}.exe  ·  最近 {item.LastSeenAt:HH:mm}",
+            DurationText = FormatUsageDuration(item.ActiveSeconds),
+            Initial = string.IsNullOrWhiteSpace(item.DisplayName) ? "·" : item.DisplayName[..1].ToUpperInvariant(),
+            Share = item.ActiveSeconds * 100D / maxSeconds
+        }).ToList();
+        EmptyUsagePanel.Visibility = entries.Count == 0 ? Visibility.Visible : Visibility.Collapsed;
+    }
+
+    private static string FormatUsageDuration(int seconds)
+    {
+        if (seconds < 60) return seconds <= 0 ? "—" : "少于 1 分钟";
+        var duration = TimeSpan.FromSeconds(seconds);
+        return duration.TotalHours >= 1
+            ? $"{(int)duration.TotalHours} 小时 {duration.Minutes} 分钟"
+            : $"{duration.Minutes} 分钟";
+    }
+
     private void ShowToday_Click(object sender, RoutedEventArgs e) => ShowTodayView();
+    private void ShowPlan_Click(object sender, RoutedEventArgs e) => ShowView(PlanView, PlanNavButton);
+    private void ShowUsage_Click(object sender, RoutedEventArgs e)
+    {
+        RefreshUsageView();
+        ShowView(UsageScroll, UsageNavButton);
+    }
     private void ShowHistory_Click(object sender, RoutedEventArgs e)
     {
         ShowView(HistoryScroll, HistoryNavButton);
@@ -439,14 +675,82 @@ public partial class MainWindow : Window
     private void ShowView(UIElement view, System.Windows.Controls.Button activeButton)
     {
         TodayScroll.Visibility = Visibility.Collapsed;
+        PlanView.Visibility = Visibility.Collapsed;
+        UsageScroll.Visibility = Visibility.Collapsed;
         HistoryScroll.Visibility = Visibility.Collapsed;
         SettingsScroll.Visibility = Visibility.Collapsed;
         view.Visibility = Visibility.Visible;
         FadeIn(view);
         TodayNavButton.Style = (Style)FindResource("IconButton");
+        PlanNavButton.Style = (Style)FindResource("IconButton");
+        UsageNavButton.Style = (Style)FindResource("IconButton");
         HistoryNavButton.Style = (Style)FindResource("IconButton");
         SettingsNavButton.Style = (Style)FindResource("IconButton");
         activeButton.Style = (Style)FindResource("SegmentedActiveButton");
+    }
+
+    private void ImportPlanWorkbook()
+    {
+        var dialog = new Microsoft.Win32.OpenFileDialog
+        {
+            Title = "导入长期工作计划",
+            Filter = "Excel 工作簿 (*.xlsx)|*.xlsx|Excel 工作簿 (*.xlsx;*.xlsm)|*.xlsx;*.xlsm",
+            DefaultExt = ".xlsx",
+            Multiselect = false,
+            CheckFileExists = true
+        };
+        if (dialog.ShowDialog(this) != true) return;
+
+        try
+        {
+            var plan = ImportPlanWorkbook(dialog.FileName);
+            _plans.Add(plan);
+            PlanView.SelectPlan(plan);
+            ShowView(PlanView, PlanNavButton);
+            AddActivity("计划", "导入长期计划", $"{plan.Name} · {plan.Tasks.Count} 项任务");
+            ShowToast($"已导入 {plan.Tasks.Count} 项任务");
+            RefreshHistoryDates();
+            QueueSave();
+        }
+        catch (Exception exception)
+        {
+            System.Windows.MessageBox.Show(this, $"无法导入这个工作簿。\n\n{exception.Message}", "导入 XLSX",
+                MessageBoxButton.OK, MessageBoxImage.Information);
+        }
+    }
+
+    private void ExportPlanWorkbook(LongPlan plan)
+    {
+        var dialog = new Microsoft.Win32.SaveFileDialog
+        {
+            Title = "导出长期工作计划",
+            Filter = "Excel 工作簿 (*.xlsx)|*.xlsx",
+            DefaultExt = ".xlsx",
+            AddExtension = true,
+            OverwritePrompt = true,
+            FileName = $"{SanitizeFileName(plan.Name)}-{DateTime.Today:yyyy-MM-dd}.xlsx"
+        };
+        if (dialog.ShowDialog(this) != true) return;
+        try
+        {
+            ExportPlanWorkbook(dialog.FileName, plan);
+            ShowToast("长期计划已导出");
+        }
+        catch (Exception exception)
+        {
+            System.Windows.MessageBox.Show(this, $"无法导出文件。\n\n{exception.Message}", "导出 XLSX",
+                MessageBoxButton.OK, MessageBoxImage.Information);
+        }
+    }
+
+    public LongPlan ImportPlanWorkbook(string inputPath) => _planWorkbook.Import(inputPath);
+    public void ExportPlanWorkbook(string outputPath, LongPlan plan) => _planWorkbook.Export(outputPath, plan);
+
+    private static string SanitizeFileName(string value)
+    {
+        var invalid = Path.GetInvalidFileNameChars();
+        var cleaned = new string(value.Select(character => invalid.Contains(character) ? '-' : character).ToArray()).Trim();
+        return string.IsNullOrWhiteSpace(cleaned) ? "FloatMate-长期计划" : cleaned;
     }
 
     private void RefreshHistoryDates()
@@ -827,6 +1131,8 @@ public partial class MainWindow : Window
         _data.Goals = _allGoals.ToList();
         _data.Records = _records.ToList();
         _data.Events = _events.ToList();
+        _data.AppUsage = _appUsage.ToList();
+        _data.Plans = _plans.ToList();
         if (!_appBar.IsRegistered)
         {
             _data.WindowLeft = Left;
@@ -890,13 +1196,81 @@ public partial class MainWindow : Window
                 Progress = 70,
                 FocusSeconds = 42 * 60,
                 EstimateMinutes = 90,
+                Details = "整理目标详情录入流程\n验证本地保存、历史复盘和 XLSM 导出",
                 IsRunning = true
             };
             _goals.Add(sample);
             _runningGoal = sample;
         }
+        if (page.StartsWith("details", StringComparison.OrdinalIgnoreCase))
+        {
+            var detailsSample = new GoalItem
+            {
+                Title = "整理发布前检查清单",
+                Status = "进行中",
+                Progress = 40,
+                FocusSeconds = 28 * 60,
+                EstimateMinutes = 60,
+                Details = "核对安装包与版本号\n完成主流程回归测试\n整理发布说明和已知限制"
+            };
+            if (page.Equals("details-edit", StringComparison.OrdinalIgnoreCase))
+            {
+                detailsSample.EditingDetails = detailsSample.Details;
+                detailsSample.IsEditingDetails = true;
+            }
+            _goals.Insert(0, detailsSample);
+        }
+        if (page.Equals("usage", StringComparison.OrdinalIgnoreCase))
+        {
+            var today = DateOnly.FromDateTime(DateTime.Now);
+            _appUsage.Clear();
+            _appUsage.AddRange(
+            [
+                new AppUsageEntry { Date = today, ProcessName = "Code", DisplayName = "Visual Studio Code", ActiveSeconds = 2 * 3600 + 18 * 60, LastSeenAt = DateTime.Now.AddMinutes(-2) },
+                new AppUsageEntry { Date = today, ProcessName = "msedge", DisplayName = "Microsoft Edge", ActiveSeconds = 74 * 60, LastSeenAt = DateTime.Now.AddMinutes(-8) },
+                new AppUsageEntry { Date = today, ProcessName = "WindowsTerminal", DisplayName = "Windows Terminal", ActiveSeconds = 39 * 60, LastSeenAt = DateTime.Now.AddMinutes(-18) },
+                new AppUsageEntry { Date = today, ProcessName = "explorer", DisplayName = "文件资源管理器", ActiveSeconds = 12 * 60, LastSeenAt = DateTime.Now.AddMinutes(-31) }
+            ]);
+        }
+        if (page.StartsWith("plan", StringComparison.OrdinalIgnoreCase) && _plans.Count == 0)
+        {
+            var plan = new LongPlan
+            {
+                Name = "产品交付 · 40 天计划",
+                StartDate = DateTime.Today,
+                EndDate = DateTime.Today.AddDays(39),
+                SourceFileName = "台州计划.xlsx",
+                Tasks =
+                [
+                    new LongPlanTask { Order = 1, Category = "环境", Title = "场地规划与准备", Owner = "孙杰", Status = "已完成", Progress = 100, StartDate = DateTime.Today, EndDate = DateTime.Today.AddDays(5) },
+                    new LongPlanTask { Order = 2, Category = "设备", Title = "设备采购与进场", Owner = "任霄原", Status = "进行中", Progress = 55, StartDate = DateTime.Today.AddDays(4), EndDate = DateTime.Today.AddDays(21), Milestone = "设备进场" },
+                    new LongPlanTask { Order = 3, Category = "物料", Title = "零部件开发和验证", Owner = "研发团队", Status = "未开始", Progress = 0, StartDate = DateTime.Today.AddDays(14), EndDate = DateTime.Today.AddDays(33) }
+                ]
+            };
+            _plans.Add(plan);
+            _plans.Add(new LongPlan
+            {
+                Name = "EVA 功能测试排期",
+                StartDate = DateTime.Today.AddDays(-7),
+                EndDate = DateTime.Today.AddDays(48),
+                Tasks =
+                [
+                    new LongPlanTask { Order = 1, Category = "范围", Title = "确认任务与验收清单", Status = "已完成", Progress = 100, StartDate = DateTime.Today.AddDays(-7), EndDate = DateTime.Today.AddDays(-5) },
+                    new LongPlanTask { Order = 2, Category = "联调", Title = "模拟车机控制闭环", Status = "进行中", Progress = 35, StartDate = DateTime.Today, EndDate = DateTime.Today.AddDays(8) }
+                ]
+            });
+            PlanView.BindPlans(_plans);
+        }
+        if ((page.Equals("plan-expanded", StringComparison.OrdinalIgnoreCase) || page.Equals("plan-completed", StringComparison.OrdinalIgnoreCase)) && _plans.Count > 0)
+            PlanView.SelectPlan(_plans[0]);
         SetExpanded(expanded);
         if (page.Equals("settings", StringComparison.OrdinalIgnoreCase)) ShowView(SettingsScroll, SettingsNavButton);
+        else if (page.StartsWith("plan", StringComparison.OrdinalIgnoreCase)) ShowView(PlanView, PlanNavButton);
+        else if (page.Equals("usage", StringComparison.OrdinalIgnoreCase))
+        {
+            RefreshUsageView();
+            ShowView(UsageScroll, UsageNavButton);
+        }
         else if (page.Equals("history", StringComparison.OrdinalIgnoreCase))
         {
             ShowView(HistoryScroll, HistoryNavButton);
@@ -904,8 +1278,17 @@ public partial class MainWindow : Window
             if (HistoryDateCombo.SelectedItem is HistoryDateOption option) RefreshHistory(option.Date);
         }
         else ShowTodayView();
+        if (page.Equals("add-goal", StringComparison.OrdinalIgnoreCase))
+        {
+            AddGoalPanel.Visibility = Visibility.Visible;
+            GoalInput.Text = "整理本周开发交付";
+            GoalDetailsInput.Text = "完成核心流程自测\n补充发布说明与待办事项";
+        }
         UpdateSummaries();
         UpdateLayout();
+        if (page.Equals("plan-completed", StringComparison.OrdinalIgnoreCase)) PlanView.PrepareCompletedPreview();
+        if (page.StartsWith("details", StringComparison.OrdinalIgnoreCase) || page.Equals("add-goal", StringComparison.OrdinalIgnoreCase))
+            TodayScroll.ScrollToTop();
         if (page.Equals("today-bottom", StringComparison.OrdinalIgnoreCase)) TodayScroll.ScrollToEnd();
     }
 

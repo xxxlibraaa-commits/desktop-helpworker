@@ -18,8 +18,9 @@ public sealed class XlsmExportService
     private const uint DecimalStyle = 6;
     private const uint DateOnlyStyle = 7;
     private const uint CenterBodyStyle = 8;
+    private const uint WrappedBodyStyle = 9;
 
-    public void ExportToday(string path, DateOnly date, IReadOnlyCollection<GoalItem> goals, IReadOnlyCollection<QuickRecord> records)
+    public void ExportWorkToday(string path, DateOnly date, IReadOnlyCollection<GoalItem> goals)
     {
         var directory = Path.GetDirectoryName(path);
         if (!string.IsNullOrWhiteSpace(directory)) Directory.CreateDirectory(directory);
@@ -27,6 +28,7 @@ public sealed class XlsmExportService
         using var document = SpreadsheetDocument.Create(path, SpreadsheetDocumentType.MacroEnabledWorkbook);
         var workbookPart = document.AddWorkbookPart();
         workbookPart.Workbook = new Workbook();
+        SpreadsheetExportCompatibility.Add(workbookPart);
 
         var stylesPart = workbookPart.AddNewPart<WorkbookStylesPart>();
         stylesPart.Stylesheet = CreateStylesheet();
@@ -34,7 +36,6 @@ public sealed class XlsmExportService
 
         var sheets = workbookPart.Workbook.AppendChild(new Sheets());
         AddGoalsSheet(workbookPart, sheets, date, goals.OrderBy(goal => goal.CreatedAt).ToList());
-        AddRecordsSheet(workbookPart, sheets, date, records.OrderBy(record => record.Timestamp).ToList());
 
         workbookPart.Workbook.CalculationProperties = new CalculationProperties
         {
@@ -50,12 +51,12 @@ public sealed class XlsmExportService
         var worksheetPart = workbookPart.AddNewPart<WorksheetPart>();
         var sheetData = new SheetData();
         worksheetPart.Worksheet = CreateWorksheet(
-            new[] { 13d, 28d, 12d, 11d, 17d, 17d, 21d, 21d },
+            new[] { 13d, 28d, 48d, 12d, 11d, 17d, 17d, 21d, 21d },
             sheetData);
 
         sheetData.Append(CreateRow(new[]
         {
-            TextCell("日期", HeaderStyle), TextCell("任务名称", HeaderStyle), TextCell("状态", HeaderStyle),
+            TextCell("日期", HeaderStyle), TextCell("任务名称", HeaderStyle), TextCell("详细工作内容", HeaderStyle), TextCell("状态", HeaderStyle),
             TextCell("进度", HeaderStyle), TextCell("预计时长（分钟）", HeaderStyle), TextCell("专注时长（分钟）", HeaderStyle),
             TextCell("创建时间", HeaderStyle), TextCell("完成时间", HeaderStyle)
         }, 26));
@@ -66,56 +67,24 @@ public sealed class XlsmExportService
             {
                 DateOnlyCell(date),
                 TextCell(goal.Title, BodyStyle),
+                TextCell(goal.Details, WrappedBodyStyle),
                 TextCell(goal.StatusLabel, CenterBodyStyle),
                 NumberCell(goal.Progress / 100d, PercentageStyle),
                 NumberCell(goal.EstimateMinutes, IntegerStyle),
                 NumberCell(goal.FocusSeconds / 60d, DecimalStyle),
                 DateCell(goal.CreatedAt),
                 goal.CompletedAt is DateTime completedAt ? DateCell(completedAt) : TextCell(string.Empty, BodyStyle)
-            }, 23));
+            }, CalculateGoalRowHeight(goal.Details)));
         }
 
-        ApplyAutoFilter(worksheetPart.Worksheet, 8, goals.Count + 1);
+        SpreadsheetExportCompatibility.AssignCellReferences(sheetData);
+        ApplyAutoFilter(worksheetPart.Worksheet, 9, goals.Count + 1);
         worksheetPart.Worksheet.Save();
         sheets.Append(new Sheet
         {
             Id = workbookPart.GetIdOfPart(worksheetPart),
             SheetId = 1U,
             Name = "今日任务"
-        });
-    }
-
-    private static void AddRecordsSheet(WorkbookPart workbookPart, Sheets sheets, DateOnly date, IReadOnlyList<QuickRecord> records)
-    {
-        var worksheetPart = workbookPart.AddNewPart<WorksheetPart>();
-        var sheetData = new SheetData();
-        worksheetPart.Worksheet = CreateWorksheet(new[] { 13d, 21d, 18d, 13d, 12d }, sheetData);
-
-        sheetData.Append(CreateRow(new[]
-        {
-            TextCell("日期", HeaderStyle), TextCell("记录时间", HeaderStyle), TextCell("类型", HeaderStyle),
-            TextCell("数量", HeaderStyle), TextCell("单位", HeaderStyle)
-        }, 26));
-
-        foreach (var record in records)
-        {
-            sheetData.Append(CreateRow(new[]
-            {
-                DateOnlyCell(date),
-                DateCell(record.Timestamp),
-                TextCell(record.Type, CenterBodyStyle),
-                record.Amount is double amount ? NumberCell(amount, IsWholeNumber(amount) ? IntegerStyle : DecimalStyle) : TextCell(string.Empty, BodyStyle),
-                TextCell(record.Unit ?? string.Empty, CenterBodyStyle)
-            }, 23));
-        }
-
-        ApplyAutoFilter(worksheetPart.Worksheet, 5, records.Count + 1);
-        worksheetPart.Worksheet.Save();
-        sheets.Append(new Sheet
-        {
-            Id = workbookPart.GetIdOfPart(worksheetPart),
-            SheetId = 2U,
-            Name = "快速记录"
         });
     }
 
@@ -193,7 +162,13 @@ public sealed class XlsmExportService
         CellValue = new CellValue(value.ToDateTime(TimeOnly.MinValue).ToOADate().ToString(CultureInfo.InvariantCulture))
     };
 
-    private static bool IsWholeNumber(double value) => Math.Abs(value - Math.Round(value)) < 0.0000001D;
+    private static double CalculateGoalRowHeight(string details)
+    {
+        if (string.IsNullOrWhiteSpace(details)) return 23D;
+        var estimatedLines = details.Split(['\r', '\n'], StringSplitOptions.RemoveEmptyEntries)
+            .Sum(line => Math.Max(1, (int)Math.Ceiling(line.Length / 32D)));
+        return Math.Clamp(8D + estimatedLines * 18D, 42D, 300D);
+    }
 
     private static string ColumnName(int columnNumber)
     {
@@ -240,8 +215,9 @@ public sealed class XlsmExportService
             new CellFormat { FontId = 0U, FillId = 0U, BorderId = 2U, NumberFormatId = 1U, ApplyFont = true, ApplyBorder = true, ApplyNumberFormat = true, ApplyAlignment = true, Alignment = new Alignment { Horizontal = HorizontalAlignmentValues.Right, Vertical = VerticalAlignmentValues.Center } },
             new CellFormat { FontId = 0U, FillId = 0U, BorderId = 2U, NumberFormatId = decimalFormatId, ApplyFont = true, ApplyBorder = true, ApplyNumberFormat = true, ApplyAlignment = true, Alignment = new Alignment { Horizontal = HorizontalAlignmentValues.Right, Vertical = VerticalAlignmentValues.Center } },
             new CellFormat { FontId = 0U, FillId = 0U, BorderId = 2U, NumberFormatId = dateOnlyFormatId, ApplyFont = true, ApplyBorder = true, ApplyNumberFormat = true, ApplyAlignment = true, Alignment = new Alignment { Horizontal = HorizontalAlignmentValues.Center, Vertical = VerticalAlignmentValues.Center } },
-            new CellFormat { FontId = 0U, FillId = 0U, BorderId = 2U, ApplyFont = true, ApplyBorder = true, ApplyAlignment = true, Alignment = new Alignment { Horizontal = HorizontalAlignmentValues.Center, Vertical = VerticalAlignmentValues.Center } })
-        { Count = 9U };
+            new CellFormat { FontId = 0U, FillId = 0U, BorderId = 2U, ApplyFont = true, ApplyBorder = true, ApplyAlignment = true, Alignment = new Alignment { Horizontal = HorizontalAlignmentValues.Center, Vertical = VerticalAlignmentValues.Center } },
+            new CellFormat { FontId = 0U, FillId = 0U, BorderId = 2U, ApplyFont = true, ApplyBorder = true, ApplyAlignment = true, Alignment = new Alignment { Vertical = VerticalAlignmentValues.Top, WrapText = true } })
+        { Count = 10U };
 
         return new Stylesheet(
             new NumberingFormats(

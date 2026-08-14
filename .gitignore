@@ -1,8 +1,12 @@
 **/bin/
 **/obj/
 **/outputs/
+**/backups/
 .codex-temp/
+.codex-*/
 .vs/
 *.user
 *.suo
+*.log
+*.tmp
 FloatMate/*preview*.png

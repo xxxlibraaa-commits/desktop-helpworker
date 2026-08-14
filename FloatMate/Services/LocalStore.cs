@@ -56,12 +56,44 @@ public sealed class LocalStore
                 data.DockedRightMode = true;
                 data.DesktopWidgetMode = false;
             }
+            if (data.SchemaVersion < 8)
+            {
+                data.SchemaVersion = 8;
+                foreach (var goal in data.Goals) goal.Details ??= string.Empty;
+            }
+            if (data.SchemaVersion < 9)
+            {
+                data.SchemaVersion = 9;
+                data.AppUsage ??= [];
+            }
+            if (data.SchemaVersion < 10)
+            {
+                BackupBeforeMigration(FilePath, data.SchemaVersion);
+                data.SchemaVersion = 10;
+                data.Plans ??= [];
+            }
+            foreach (var plan in data.Plans ?? []) plan.Tasks ??= [];
             data.ActiveDate = DateOnly.FromDateTime(DateTime.Now);
             return data;
         }
         catch
         {
             return NewDay();
+        }
+    }
+
+    private static void BackupBeforeMigration(string filePath, int schemaVersion)
+    {
+        try
+        {
+            var backupDirectory = Path.Combine(Path.GetDirectoryName(filePath)!, "backups");
+            Directory.CreateDirectory(backupDirectory);
+            var backupPath = Path.Combine(backupDirectory, $"data-schema{schemaVersion}-{DateTime.Now:yyyyMMdd-HHmmss}.json");
+            File.Copy(filePath, backupPath, false);
+        }
+        catch
+        {
+            // A backup failure must not prevent loading the existing local data.
         }
     }
 
